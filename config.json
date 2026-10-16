@@ -1,0 +1,9 @@
+{
+  "model": "p1",
+  "celsius": false,
+  "min": 65.0,
+  "max": 95.0,
+    "high_res": true,
+    "webcam":0,
+  "logfile": "spot_temps.csv"
+}
