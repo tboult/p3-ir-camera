@@ -1,22 +1,39 @@
 #!/usr/bin/env python3
-"""P3/P1 Thermal Camera Viewer.
+"""Dual-Stream Thermal & Visible Camera Inspector (`dual_viewer.py`).
 
-Display, colormaps, and image processing (ISP) for the P3/P1 thermal camera.
+Combines standard thermal imaging (P1/P3) with a visible webcam stream, 
+providing real-time out-of-range edge detection, lock-in analysis, interactive 
+canvas UI buttons, and spot temperature CSV logging.
 
-Controls:
-  q - Quit           +/- - Zoom
-  r - Rotate 90°     c - Colormap
-  s - Shutter/NUC    g - Gain mode
-  m - Mirror         h - Help
-  space - Screenshot D - Dump raw data
-  e - Emissivity     1-9 - Set emissivity (0.1-0.9)
-  x - Scale mode     p - Enhanced (CLAHE+DDE)
-  a - AGC mode       t - Toggle reticule
-  d - Toggle DDE     b - Toggle min/max marker
-  f - Toggle Fixed Range Lock
-  v - Toggle Video Recording
-  L / o - Toggle Spot Temp Logging
+Usage:
+  python dual_viewer.py
+  python dual_viewer.py --config config.json
+  python dual_viewer.py --webcam 0 --min 65 --max 95 --high-res --logfile spot_log.csv
+
+Interactive Controls:
+  q         - Quit application
+  f         - Toggle Fixed Range Lock (Out-of-range edge highlighting)
+  l / o     - Toggle Live Spot Temperature CSV Logging
+  v         - Toggle MP4 Video Recording
+  h         - Toggle On-Screen Keyboard Help Legend
+  c         - Cycle Colormaps (Rainbow, Ironbow, White Hot, etc.)
+  g         - Toggle Gain Mode (High/Low)
+  r / m     - Rotate (90°) / Mirror image
+  + / -     - Digital Zoom
+  space     - Save PNG Screenshot
+  D         - Dump raw binary thermal matrix (.npy)
+
+Config File Format (`config.json`):
+  {
+    "model": "p1",
+    "webcam": 0,
+    "min": 65.0,
+    "max": 95.0,
+    "high_res": true,
+    "logfile": "spot_temps.csv"
+  }
 """
+
 
 from __future__ import annotations
 
@@ -321,6 +338,7 @@ class P3Viewer:
         self.target_w = 640 if high_res else 320
         self.target_h = 480 if high_res else 240
         self.scale_factor = 2.0 if high_res else 1.0
+        self._last_clean_thermal_gray: NDArray[np.uint8] | None = None
 
         # UI Bar Dimensions
         sf = self.scale_factor
@@ -370,6 +388,11 @@ class P3Viewer:
         self.video_writer: cv2.VideoWriter | None = None
         self.video_filename: str | None = None
         self._video_dim: tuple[int, int] | None = None
+
+        # Alignment Modes: 0 = OFF, 1 = WARP VISIBLE, 2 = WARP + OVERLAY
+        self.align_mode: int = 0
+        self.needs_alignment_compute: bool = False
+        self.transform_matrix: NDArray[np.float32] | None = None
 
         # Lock-in controller
         self.lockin_controller: LockInController | None = None
@@ -519,26 +542,73 @@ class P3Viewer:
     def _process_dual_camera(
         self, thermal_canvas: NDArray[np.uint8]
     ) -> tuple[NDArray[np.uint8], NDArray[np.uint8]]:
-        """Composite visible camera stream on left."""
+        """Composite expanded visible camera stream on left with 3-mode ECC alignment."""
         if self.cap_visible is not None and self.cap_visible.isOpened():
             ret, vis_frame = self.cap_visible.read()
             canvas_h = thermal_canvas.shape[0]
             thermal_h = max(1, canvas_h - self.top_bar_h - self.bottom_bar_h)
+            thermal_w = self.target_w
 
             if ret and vis_frame is not None:
-                vh, vw = vis_frame.shape[:2]
-                aspect = vw / max(1, vh)
-                vis_w = int(thermal_h * aspect)
+                # Isolate clean thermal color region (excluding top/bottom UI bars)
+                thermal_color_crop = thermal_canvas[
+                    self.top_bar_h : self.top_bar_h + thermal_h, 0:thermal_w
+                ]
 
-                gray_vis = cv2.cvtColor(vis_frame, cv2.COLOR_BGR2GRAY)
-                gray_vis = cv2.resize(gray_vis, (vis_w, thermal_h), interpolation=cv2.INTER_AREA)
-                vis_bgr = cv2.cvtColor(gray_vis, cv2.COLOR_GRAY2BGR)
+                # Ensure visible frame is BGR and matches thermal resolution
+                if vis_frame.ndim == 2:
+                    vis_bgr = cv2.cvtColor(vis_frame, cv2.COLOR_GRAY2BGR)
+                else:
+                    vis_bgr = vis_frame.copy()
+
+                vis_resized = cv2.resize(vis_bgr, (thermal_w, thermal_h), interpolation=cv2.INTER_AREA)
+
+                # --- 3-Mode Auto-Alignment & Warping Logic ---
+                if self.align_mode in (1, 2):
+                    if self.needs_alignment_compute or self.transform_matrix is None:
+                        clean_gray = (
+                            self._last_clean_thermal_gray
+                            if self._last_clean_thermal_gray is not None
+                            else cv2.cvtColor(thermal_canvas, cv2.COLOR_BGR2GRAY)
+                        )
+                        if clean_gray.shape[:2] != (thermal_h, thermal_w):
+                            clean_gray = cv2.resize(clean_gray, (thermal_w, thermal_h), interpolation=cv2.INTER_AREA)
+
+                        self.transform_matrix = self._compute_alignment(vis_resized, clean_gray)
+                        self.needs_alignment_compute = False
+
+                    if self.transform_matrix is not None:
+                        vis_resized = cv2.warpAffine(
+                            vis_resized,
+                            self.transform_matrix,
+                            (thermal_w, thermal_h),
+                            flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                        )
+
+                # Mode 2: Blend 50/50 warped visible frame with thermal color overlay
+                if self.align_mode == 2 and self.transform_matrix is not None:
+                    vis_bgr = cv2.addWeighted(vis_resized, 0.5, thermal_color_crop, 0.5, 0)
+                else:
+                    vis_bgr = vis_resized
+
+                # On-screen mode status indicator badge
+                mode_labels = {0: "Align: OFF", 1: "Align: WARP", 2: "Align: OVERLAY"}
+                status_text = mode_labels[self.align_mode]
+                cv2.putText(
+                    vis_bgr,
+                    status_text,
+                    (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5 * self.scale_factor,
+                    (0, 255, 255) if self.align_mode > 0 else (180, 180, 180),
+                    1,
+                    self.cv_linetype,
+                )
             else:
-                vis_w = self.target_w
-                vis_bgr = np.zeros((thermal_h, vis_w, 3), dtype=np.uint8)
+                vis_bgr = np.zeros((thermal_h, thermal_w, 3), dtype=np.uint8)
 
-            vis_padded = np.zeros((canvas_h, vis_w, 3), dtype=np.uint8)
-            vis_padded[self.top_bar_h : self.top_bar_h + thermal_h, 0:vis_w] = vis_bgr
+            vis_padded = np.zeros((canvas_h, thermal_w, 3), dtype=np.uint8)
+            vis_padded[self.top_bar_h : self.top_bar_h + thermal_h, 0:thermal_w] = vis_bgr
 
             composite = np.hstack([vis_padded, thermal_canvas])
             return composite, composite
@@ -678,6 +748,8 @@ class P3Viewer:
                 img, (w * 2, h * 2), interpolation=SCALE_INTERP[self.scale_mode]
             )
             img = np.asarray(resized, dtype=np.uint8)
+
+        self._last_clean_thermal_gray = img.copy()
 
         if not use_fixed_range and self.use_clahe:
             clahe_result: Any = self._clahe.apply(img)
@@ -1021,6 +1093,8 @@ class P3Viewer:
         if key == ord("q"):
             return False
 
+        #print("In handle key with key:",key, ord("W"),ord("w"))
+
         if key == ord("v"):
             self._toggle_video_recording()
         elif key in (ord("l"), ord("L"), ord("o")):  # 'l' or 'L' toggles logging
@@ -1075,8 +1149,19 @@ class P3Viewer:
         elif key == ord("b"):
             self.hotspot_mode = HotspotMode((self.hotspot_mode + 1) % len(HotspotMode))
             print(f"Hotspot mode: {self.hotspot_mode.name}")
+        elif key == ord("w") :  # Warp
+            self.align_mode = (self.align_mode + 1) % 3
+            if self.align_mode == 1:
+                self.needs_alignment_compute = True
+                print("Alignment Mode 1: WARP VISIBLE (Computing transform...)")
+            elif self.align_mode == 2:
+                print("Alignment Mode 2: WARP VISIBLE + THERMAL OVERLAY")
+            else:
+                print("Alignment Mode 0: OFF")
 
         return True
+
+                
 
     def _toggle_enhanced(self) -> None:
         self.enhanced = not self.enhanced
@@ -1126,6 +1211,93 @@ class P3Viewer:
                 break
         self._set_emissivity(values[idx])
 
+    def _compute_alignment(
+        self,
+        visible_img: NDArray[np.uint8],
+        thermal_gray: NDArray[np.uint8],
+        min_cc_threshold: float = 0.15,
+    ) -> NDArray[np.float32] | None:
+        """Compute alignment warp matrix using Multi-Scale Pyramid ECC on clean 1-channel edge maps."""
+        try:
+            # 1. Force visible frame to single-channel 2D uint8 grayscale
+            if visible_img.ndim == 3:
+                vis_gray = cv2.cvtColor(visible_img, cv2.COLOR_BGR2GRAY)
+            else:
+                vis_gray = visible_img.copy()
+
+            # 2. Force thermal frame to single-channel 2D uint8 grayscale
+            if thermal_gray.ndim == 3:
+                thm_gray = cv2.cvtColor(thermal_gray, cv2.COLOR_BGR2GRAY)
+            else:
+                thm_gray = thermal_gray.copy()
+
+            # 3. Match resolution
+            th, tw = thm_gray.shape[:2]
+            if vis_gray.shape[:2] != (th, tw):
+                vis_gray = cv2.resize(vis_gray, (tw, th), interpolation=cv2.INTER_AREA)
+
+            # 4. Blur to suppress clutter and broaden gradient ramps
+            vis_blurred = cv2.GaussianBlur(vis_gray, (5, 5), 0)
+            thm_blurred = cv2.GaussianBlur(thm_gray, (5, 5), 0)
+
+            # 5. Compute 1-channel Sobel structural gradient magnitude maps
+            vis_gx = cv2.Sobel(vis_blurred, cv2.CV_32F, 1, 0, ksize=3)
+            vis_gy = cv2.Sobel(vis_blurred, cv2.CV_32F, 0, 1, ksize=3)
+            vis_edges = cv2.magnitude(vis_gx, vis_gy)
+
+            thm_gx = cv2.Sobel(thm_blurred, cv2.CV_32F, 1, 0, ksize=3)
+            thm_gy = cv2.Sobel(thm_blurred, cv2.CV_32F, 0, 1, ksize=3)
+            thm_edges = cv2.magnitude(thm_gx, thm_gy)
+
+            # Ensure strict 1-channel float32 matrices
+            if vis_edges.ndim > 2:
+                vis_edges = vis_edges[:, :, 0]
+            if thm_edges.ndim > 2:
+                thm_edges = thm_edges[:, :, 0]
+
+            # Normalize gradient maps to [0, 1] range
+            vis_edges = cv2.normalize(vis_edges, None, 0.0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+            thm_edges = cv2.normalize(thm_edges, None, 0.0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+
+            # 6. Build 3-level Gaussian Pyramids for Coarse-to-Fine Optimization
+            levels = 3
+            vis_pyr = [vis_edges]
+            thm_pyr = [thm_edges]
+
+            for _ in range(1, levels):
+                vis_pyr.insert(0, cv2.pyrDown(vis_pyr[0]))
+                thm_pyr.insert(0, cv2.pyrDown(thm_pyr[0]))
+
+            # Initialize 2x3 Affine transformation matrix
+            warp_matrix = np.eye(2, 3, dtype=np.float32)
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 80, 1e-4)
+
+            cc = 0.0
+            # 7. Run ECC iteratively from coarse (small) to fine (full resolution)
+            for level in range(levels):
+                v_lvl = vis_pyr[level]
+                t_lvl = thm_pyr[level]
+
+                cc, warp_matrix = cv2.findTransformECC(
+                    t_lvl, v_lvl, warp_matrix, cv2.MOTION_AFFINE, criteria
+                )
+
+                if level < levels - 1:
+                    warp_matrix[0, 2] *= 2.0
+                    warp_matrix[1, 2] *= 2.0
+
+            # 8. Reject low-quality correlation matches (< 0.15)
+            if cc < min_cc_threshold:
+                print(f"Alignment REJECTED: Correlation score too low ({cc:.3f} < {min_cc_threshold:.3f})")
+                return None
+
+            print(f"ECC Alignment Converged! (Correlation Score: {cc:.3f})")
+            return warp_matrix
+
+        except cv2.error as e:
+            print(f"ECC Alignment failed to converge: {e}")
+        return None
+
 def load_config_file(config_path: str) -> dict[str, Any]:
     """Load settings dictionary from JSON configuration file and normalize keys."""
     alias_map = {
@@ -1161,7 +1333,6 @@ def load_config_file(config_path: str) -> dict[str, Any]:
         "model": "model",
         "logfile": "logfile",
     }
-
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1171,7 +1342,8 @@ def load_config_file(config_path: str) -> dict[str, Any]:
                     clean_k = k.lower().strip()
                     target_key = alias_map.get(clean_k, clean_k.replace("-", "_"))
                     normalized[target_key] = v
-                print(f"Loaded configuration from: {config_path}")
+                    
+                    print(f"Loaded configuration from: {config_path}")
                 return normalized
             print(f"Warning: Config file {config_path} is not a valid JSON dictionary.")
     except Exception as e:
