@@ -12,6 +12,7 @@ Usage:
 
 Interactive Controls:
   q         - Quit application
+  w         - Cycle Alignment Modes (OFF -> RAW OVERLAY -> ORB+ECC -> ORB+ECC OVERLAY -> HAND ECC -> HAND ECC OVERLAY)
   f         - Toggle Fixed Range Lock (Out-of-range edge highlighting)
   l / o     - Toggle Live Spot Temperature CSV Logging
   v         - Toggle MP4 Video Recording
@@ -33,7 +34,6 @@ Config File Format (`config.json`):
     "logfile": "spot_temps.csv"
   }
 """
-
 
 from __future__ import annotations
 
@@ -66,6 +66,73 @@ from p3_camera import (
     raw_to_celsius_corrected,
 )
 
+# Suppress verbose OpenCV/libjpeg C-level warnings in stdout/stderr
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
+
+
+class ThreadedWebcam:
+    """Non-blocking background frame fetcher with V4L2 buffer overflow protection."""
+
+    def __init__(self, src: int | str | None):
+        self.cap = None
+        self.running = False
+        self.ret = False
+        self.frame = None
+        self.lock = threading.Lock()
+
+        if src is None:
+            return
+
+        cam_arg = int(src) if (isinstance(src, str) and src.isdigit()) else src
+
+        self.cap = cv2.VideoCapture(cam_arg, cv2.CAP_V4L2)
+        if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(cam_arg)
+
+        if self.cap.isOpened():
+            # 1. Set driver buffer size to 1 to prevent queue overruns/corrupt frames
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            # 2. Configure MJPG format
+            mjpg_fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            self.cap.set(cv2.CAP_PROP_FOURCC, mjpg_fourcc)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+
+            self.ret, self.frame = self.cap.read()
+            self.running = True
+            self.thread = threading.Thread(target=self._update, daemon=True)
+            self.thread.start()
+            print(f"Threaded webcam initialized on device {src}")
+        else:
+            print(f"Warning: ThreadedWebcam could not open camera {src}")
+
+    def _update(self) -> None:
+        while self.running:
+            if self.cap and self.cap.isOpened():
+                ret, frame = self.cap.read()
+                # Ensure frame is valid and non-corrupt before storing
+                if ret and frame is not None and frame.size > 0:
+                    with self.lock:
+                        self.ret, self.frame = ret, frame
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        with self.lock:
+            return self.ret, (self.frame.copy() if self.frame is not None else None)
+
+    def isOpened(self) -> bool:
+        """Expose open status for P3Viewer interface checks."""
+        return self.cap is not None and self.cap.isOpened()
+
+    def release(self) -> None:
+        """Safely stop background thread and release hardware handle."""
+        self.running = False
+        if hasattr(self, "thread") and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        if self.cap is not None:
+            self.cap.release()
+
 
 # =============================================================================
 # Helper Functions & Configuration Loader
@@ -79,8 +146,6 @@ def celsius_to_fahrenheit(c: float | NDArray[np.floating]) -> float | NDArray[np
 def fahrenheit_to_celsius(f: float) -> float:
     """Convert Fahrenheit to Celsius."""
     return (f - 32.0) / 1.8
-
-
 
 
 # =============================================================================
@@ -197,26 +262,6 @@ def apply_colormap(
     return lut[img_u8]
 
 
-def apply_diverging_colormap(data: np.ndarray, cmap_name: str = "bwr") -> np.ndarray:
-    data = np.asarray(data, dtype=np.float32)
-    lo = float(np.nanpercentile(data, 0.01))
-    hi = float(np.nanpercentile(data, 99.99))
-    if hi <= lo:
-        hi = lo + 1.0
-    norm_data = 2 * (data - lo) / (hi - lo) - 1.0
-    data = np.clip(norm_data, -1.0, 1.0)
-
-    norm = mcolors.TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
-    cmap = cm.get_cmap(cmap_name)
-
-    rgba_float = cmap(norm(data))
-    rgb_float = rgba_float[..., :3]
-    rgb_uint8 = (rgb_float * 255).astype(np.uint8)
-
-    bgr_uint8 = rgb_uint8[..., ::-1]
-    return bgr_uint8
-
-
 # =============================================================================
 # Image Processing (ISP)
 # =============================================================================
@@ -331,7 +376,6 @@ class P3Viewer:
         self.use_celsius = use_celsius
         self.unit_str = "C" if use_celsius else "F"
         self.visible_cam_id = visible_cam
-        self.cap_visible: cv2.VideoCapture | None = None
 
         # Resolution & scaling settings
         self.high_res = high_res
@@ -349,17 +393,21 @@ class P3Viewer:
         # Logfile setup
         self.logfile = logfile
         self.logging_enabled: bool = logfile is not None
-        self._spot_temp_buffer: list[float] = []
+        self._spot_temp_buffer: list[list[float]] = []
 
         if self.logging_enabled and self.logfile:
-            self._init_logfile(self.logfile)
+            self.active_logfile = self._generate_timestamped_filename(self.logfile)
+            self._init_logfile(self.active_logfile)
+        else:
+            self.active_logfile = None
+            
 
         # Mouse tracking & Interactive UI Button Bounds
         self.mouse_x: int = -1
         self.mouse_y: int = -1
         self.ui_buttons: dict[str, tuple[int, int, int, int]] = {}
 
-        self.rotation: int = 0
+        self.rotation: int = 90
         self.colormap_idx: int = ColormapID.RAINBOW
         self.mirror: bool = False
         self.show_help: bool = False
@@ -389,7 +437,13 @@ class P3Viewer:
         self.video_filename: str | None = None
         self._video_dim: tuple[int, int] | None = None
 
-        # Alignment Modes: 0 = OFF, 1 = WARP VISIBLE, 2 = WARP + OVERLAY
+        # Alignment Modes:
+        # 0 = OFF (Side by side, unwarped)
+        # 1 = RAW OVERLAY (Unwarped 50/50 raw blend)
+        # 2 = ORB+ECC (WARP VISIBLE)
+        # 3 = ORB+ECC (OVERLAY)
+        # 4 = HAND ECC (WARP VISIBLE)
+        # 5 = HAND ECC (OVERLAY)
         self.align_mode: int = 0
         self.needs_alignment_compute: bool = False
         self.transform_matrix: NDArray[np.float32] | None = None
@@ -399,36 +453,108 @@ class P3Viewer:
         self.lockin_thread: threading.Thread | None = None
         self.lockin_running: bool = False
 
+        # Background threaded webcam initialization
+        self.cap_visible = ThreadedWebcam(self.visible_cam_id)
+
+
+    def _generate_timestamped_filename(self, filename: str | None = None) -> str:
+        """Generate a unique timestamped filename to prevent overwriting past logs."""
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        if filename:
+            base, ext = os.path.splitext(filename)
+            ext = ext if ext else ".csv"
+            return f"{base}_{ts}{ext}"
+        return f"column_log_{ts}.csv"
+
     def _init_logfile(self, filename: str) -> None:
-        """Initialize logfile header."""
+        """Initialize CSV header for 15-point column temporal statistics."""
         try:
             with open(filename, "a") as f:
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                f.write(f"# Thermal Log initialized {ts}\nTimestamp,Min,Max,Median,Unit\n")
-            print(f"Spot temperature logging enabled -> {filename}")
+                f.write(f"# Vertical Column Thermal Log initialized {ts}\n")
+
+                # Column order: P8_Center leading, followed by P1..P15
+                p_names = ["P8_Center"] + [f"P{i}" for i in range(1, 16)]
+                
+                # Metric blocks: Mean -> Median -> Min -> Max
+                mean_cols = [f"Mean_{p}" for p in p_names]
+                med_cols  = [f"Med_{p}" for p in p_names]
+                min_cols  = [f"Min_{p}" for p in p_names]
+                max_cols  = [f"Max_{p}" for p in p_names]
+
+                headers = ["Timestamp"] + mean_cols + med_cols + min_cols + max_cols + ["Unit"]
+                f.write(",".join(headers) + "\n")
+            print(f"Column temperature logging enabled -> {filename}")
         except Exception as e:
             print(f"Warning: Could not open log file {filename}: {e}")
 
-    def _log_spot_temp(self, tspot: float) -> None:
-        """Buffer spot temp and write min, max, and median every 25 frames."""
-        if not self.logging_enabled or not self.logfile:
+    def _get_column_samples(self, temp_disp: NDArray[np.float32]) -> list[float]:
+        """Extract 15 temperature samples spaced 5 raw pixels apart along display vertical axis."""
+        th, tw = temp_disp.shape[:2]
+        cx, cy = tw // 2, th // 2
+
+        samples = []
+        for i in range(1, 16):  # Points P1 to P15
+            offset = (i - 8) * 5  # Center at i=8 (offset 0), spacing = 5 raw px
+
+            if self.rotation in (90, 270):
+                direction = 1 if self.rotation == 90 else -1
+                x_raw = np.clip(cx + offset * direction, 0, tw - 1)
+                y_raw = cy
+            else:
+                direction = 1 if self.rotation == 0 else -1
+                x_raw = cx
+                y_raw = np.clip(cy + offset * direction, 0, th - 1)
+
+            samples.append(float(temp_disp[y_raw, x_raw]))
+
+        p8_center = samples[7]  # Index 7 is P8 Center
+        return [p8_center] + samples  # 16 values total: [P8_Center, P1..P15]
+
+    def _log_column_temps(self, temp_disp: NDArray[np.float32]) -> None:
+        """Buffer column points over 25 frames and write Mean, Median, Min, Max stats."""
+        if not self.logging_enabled or not getattr(self, "active_logfile", None):
             return
 
-        self._spot_temp_buffer.append(tspot)
-        if len(self._spot_temp_buffer) >= 25:
-            t_min = min(self._spot_temp_buffer)
-            t_max = max(self._spot_temp_buffer)
-            t_med = float(np.median(self._spot_temp_buffer))
-            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        frame_samples = self._get_column_samples(temp_disp)
+        self._spot_temp_buffer.append(frame_samples)
 
-            log_line = f"{ts},{t_min:.2f},{t_max:.2f},{t_med:.2f},{self.unit_str}\n"
+        if len(self._spot_temp_buffer) >= 25:
+            arr = np.array(self._spot_temp_buffer, dtype=np.float32)  # Shape (25, 16)
+
+            # Compute stats over time window (25 frames) for each point
+            mean_vals = np.mean(arr, axis=0)     # 16 values
+            med_vals  = np.median(arr, axis=0)   # 16 values
+            min_vals  = np.min(arr, axis=0)      # 16 values
+            max_vals  = np.max(arr, axis=0)      # 16 values
+
+            # Order: Mean for all points -> Median for all points -> Min for all points -> Max for all points
+            all_stats = np.concatenate([mean_vals, med_vals, min_vals, max_vals])
+
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            vals_str = ",".join(f"{v:.1f}" for v in all_stats)
+            log_line = f"{ts},{vals_str},{self.unit_str}\n"
+
             try:
-                with open(self.logfile, "a") as f:
+                with open(self.active_logfile, "a") as f:
                     f.write(log_line)
             except Exception as e:
-                print(f"Error writing to log file {self.logfile}: {e}")
+                print(f"Error writing to log file {self.active_logfile}: {e}")
 
             self._spot_temp_buffer.clear()
+
+    def _toggle_spot_logging(self) -> None:
+        """Toggle spot temperature logging live with unique timestamped files."""
+        self.logging_enabled = not self.logging_enabled
+        if self.logging_enabled:
+            base_name = self.logfile if self.logfile else "column_log.csv"
+            self.active_logfile = self._generate_timestamped_filename(base_name)
+            self._spot_temp_buffer.clear()
+            self._init_logfile(self.active_logfile)
+            print(f"Column logging: STARTED -> {self.active_logfile}")
+        else:
+            print("Column logging: STOPPED")        
+
 
     def _on_mouse(self, event: int, x: int, y: int, flags: int, param: Any) -> None:
         """Handle mouse hover and button click interactions."""
@@ -452,25 +578,8 @@ class P3Viewer:
         """Main viewer loop."""
         model_name = self.model.value.upper()
         print(f"{model_name} Thermal Viewer")
-        self.camera.connect()
-        name, version = self.camera.init()
-        print(f"Device: {name}, Firmware: {version}")
-        self.camera.start_streaming()
 
-        if self.visible_cam_id is not None:
-            cam_idx = (
-                int(self.visible_cam_id)
-                if str(self.visible_cam_id).isdigit()
-                else self.visible_cam_id
-            )
-            self.cap_visible = cv2.VideoCapture(cam_idx)
-            if self.cap_visible.isOpened():
-                print(f"Visible camera initialized: {self.visible_cam_id}")
-            else:
-                print(f"Warning: Could not open visible camera {self.visible_cam_id}")
-
-        print("Press 'h' for help")
-
+        # Create display window immediately with splash screen
         window_name = f"{model_name} Thermal"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(window_name, self._on_mouse)
@@ -479,6 +588,28 @@ class P3Viewer:
         total_w = (self.target_w + self.right_bar_w) if not dual_active else (self.target_w * 2 + self.right_bar_w)
         total_h = self.target_h + self.top_bar_h + self.bottom_bar_h
         cv2.resizeWindow(window_name, total_w, total_h)
+
+        splash = np.zeros((total_h, total_w, 3), dtype=np.uint8)
+        cv2.putText(
+            splash,
+            "Initializing Thermal Camera...",
+            (int(20 * self.scale_factor), total_h // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6 * self.scale_factor,
+            (0, 255, 255),
+            1,
+            self.cv_linetype,
+        )
+        cv2.imshow(window_name, splash)
+        cv2.waitKey(1)
+
+        # Connect and initialize thermal camera hardware
+        self.camera.connect()
+        name, version = self.camera.init()
+        print(f"Device: {name}, Firmware: {version}")
+        self.camera.start_streaming()
+
+        print("Press 'h' for help")
 
         try:
             while True:
@@ -497,6 +628,7 @@ class P3Viewer:
 
                 thermal = tnr(thermal, self._prev_frame, alpha=self.tnr_alpha)
                 self._prev_frame = thermal.copy()
+
 
                 rendered_thermal = self._render(thermal)
                 final_display, record_frame = self._process_dual_camera(rendered_thermal)
@@ -542,7 +674,7 @@ class P3Viewer:
     def _process_dual_camera(
         self, thermal_canvas: NDArray[np.uint8]
     ) -> tuple[NDArray[np.uint8], NDArray[np.uint8]]:
-        """Composite expanded visible camera stream on left with 3-mode ECC alignment."""
+        """Composite expanded visible camera stream on left with 6-mode alignment cycle."""
         if self.cap_visible is not None and self.cap_visible.isOpened():
             ret, vis_frame = self.cap_visible.read()
             canvas_h = thermal_canvas.shape[0]
@@ -550,12 +682,10 @@ class P3Viewer:
             thermal_w = self.target_w
 
             if ret and vis_frame is not None:
-                # Isolate clean thermal color region (excluding top/bottom UI bars)
                 thermal_color_crop = thermal_canvas[
                     self.top_bar_h : self.top_bar_h + thermal_h, 0:thermal_w
                 ]
 
-                # Ensure visible frame is BGR and matches thermal resolution
                 if vis_frame.ndim == 2:
                     vis_bgr = cv2.cvtColor(vis_frame, cv2.COLOR_GRAY2BGR)
                 else:
@@ -563,8 +693,13 @@ class P3Viewer:
 
                 vis_resized = cv2.resize(vis_bgr, (thermal_w, thermal_h), interpolation=cv2.INTER_AREA)
 
-                # --- 3-Mode Auto-Alignment & Warping Logic ---
-                if self.align_mode in (1, 2):
+                # --- 6-Mode Alignment & Warping Logic ---
+                # Mode 1: RAW OVERLAY (Unwarped raw 50/50 blend)
+                if self.align_mode == 1:
+                    vis_bgr = cv2.addWeighted(vis_resized, 0.5, thermal_color_crop, 0.5, 0)
+
+                # Modes 2 to 5: Warped Modes
+                elif self.align_mode in (2, 3, 4, 5):
                     if self.needs_alignment_compute or self.transform_matrix is None:
                         clean_gray = (
                             self._last_clean_thermal_gray
@@ -574,7 +709,10 @@ class P3Viewer:
                         if clean_gray.shape[:2] != (thermal_h, thermal_w):
                             clean_gray = cv2.resize(clean_gray, (thermal_w, thermal_h), interpolation=cv2.INTER_AREA)
 
-                        self.transform_matrix = self._compute_alignment(vis_resized, clean_gray)
+                        use_hand_roi = self.align_mode in (4, 5)
+                        self.transform_matrix = self._compute_alignment(
+                            vis_resized, clean_gray, use_hand_roi=use_hand_roi
+                        )
                         self.needs_alignment_compute = False
 
                     if self.transform_matrix is not None:
@@ -585,21 +723,31 @@ class P3Viewer:
                             flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
                         )
 
-                # Mode 2: Blend 50/50 warped visible frame with thermal color overlay
-                if self.align_mode == 2 and self.transform_matrix is not None:
-                    vis_bgr = cv2.addWeighted(vis_resized, 0.5, thermal_color_crop, 0.5, 0)
+                    # Overlay Blending for Modes 3 and 5
+                    if self.align_mode in (3, 5) and self.transform_matrix is not None:
+                        vis_bgr = cv2.addWeighted(vis_resized, 0.5, thermal_color_crop, 0.5, 0)
+                    else:
+                        vis_bgr = vis_resized
+
                 else:
                     vis_bgr = vis_resized
 
-                # On-screen mode status indicator badge
-                mode_labels = {0: "Align: OFF", 1: "Align: WARP", 2: "Align: OVERLAY"}
+                # Mode Display Badges
+                mode_labels = {
+                    0: "Align: OFF",
+                    1: "Align: RAW OVERLAY (NO WARP)",
+                    2: "Align: ORB+ECC WARP",
+                    3: "Align: ORB+ECC OVERLAY",
+                    4: "Align: HAND ECC WARP",
+                    5: "Align: HAND ECC OVERLAY"
+                }
                 status_text = mode_labels[self.align_mode]
                 cv2.putText(
                     vis_bgr,
                     status_text,
                     (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5 * self.scale_factor,
+                    0.45 * self.scale_factor,
                     (0, 255, 255) if self.align_mode > 0 else (180, 180, 180),
                     1,
                     self.cv_linetype,
@@ -689,6 +837,11 @@ class P3Viewer:
         else:
             temp_disp = temp_c.copy()
 
+        # Buffer & log vertical column spot temperatures
+        self._log_column_temps(temp_disp)
+        
+            
+
         cy, cx = self._get_spot_coords(thermal)
         tspot = float(temp_disp[cy, cx])
         frame_stats["tspot"] = tspot
@@ -698,8 +851,6 @@ class P3Viewer:
         frame_stats["tmax"] = float(temp_disp.ravel()[frame_stats["cmax"]])
         self._current_frame_stats = frame_stats
 
-        # Buffer & log spot temperature
-        self._log_spot_temp(tspot)
 
         use_fixed_range = (
             self.fixed_range_enabled
@@ -712,7 +863,6 @@ class P3Viewer:
             t_min = cast(float, self.cbar_min)
             t_max = cast(float, self.cbar_max)
 
-            # Continuous [t_min, t_max] mapping to [0, 255]
             norm_in = np.clip((temp_disp - t_min) / (t_max - t_min), 0.0, 1.0)
             img = (norm_in * 255.0).astype(np.uint8)
         else:
@@ -763,7 +913,6 @@ class P3Viewer:
 
         img = apply_colormap(img, self.colormap_idx)
 
-        # Out-of-range edge detection logic
         if use_fixed_range:
             t_min = cast(float, self.cbar_min)
             t_max = cast(float, self.cbar_max)
@@ -780,7 +929,6 @@ class P3Viewer:
             mask_cold = temp_scaled < t_min
             mask_hot = temp_scaled > t_max
 
-            # Structural Sobel magnitude
             t_range = max(1e-3, float(temp_scaled.max() - temp_scaled.min()))
             temp_norm_u8 = np.clip(
                 (temp_scaled - temp_scaled.min()) / t_range * 255.0, 0, 255
@@ -796,12 +944,10 @@ class P3Viewer:
             edge_norm = np.clip(edge_mag / p99, 0.0, 1.0)
             edge_u8 = (np.power(edge_norm, 0.5) * 255.0).astype(np.uint8)
 
-            # Cold (T < t_min): Dark background + bright white edges
             bg_cold = (temp_norm_u8.astype(np.float32) * 0.1).astype(np.uint8)
             gray_cold = np.clip(bg_cold.astype(np.int16) + edge_u8.astype(np.int16), 0, 255).astype(np.uint8)
             gray_cold_bgr = cv2.cvtColor(gray_cold, cv2.COLOR_GRAY2BGR)
 
-            # Hot (T > t_max): White background + dark/black edges
             gray_hot = np.clip(255 - edge_u8.astype(np.int16), 0, 255).astype(np.uint8)
             gray_hot_bgr = cv2.cvtColor(gray_hot, cv2.COLOR_GRAY2BGR)
 
@@ -829,11 +975,40 @@ class P3Viewer:
 
         if self.show_reticule:
             sf = self.scale_factor
-            th, tw = thermal_img.shape[:2]
-            cx_d, cy_d = tw // 2, th // 2
+            th_disp, tw_disp = thermal_img.shape[:2]
+            cx_d, cy_d = tw_disp // 2, th_disp // 2
             r_len = int(10 * sf)
+
+            # Draw center reticule crosshair
             cv2.line(thermal_img, (cx_d - r_len, cy_d), (cx_d + r_len, cy_d), COLOR_RETICULE, max(1, int(sf)), self.cv_linetype)
             cv2.line(thermal_img, (cx_d, cy_d - r_len), (cx_d, cy_d + r_len), COLOR_RETICULE, max(1, int(sf)), self.cv_linetype)
+
+            # Create an inversion mask for all 15 sampling points (P1..P15)
+            pt_mask = np.zeros((th_disp, tw_disp), dtype=np.uint8)
+            th_raw, tw_raw = thermal.shape[:2]
+            cx_raw, cy_raw = tw_raw // 2, th_raw // 2
+
+            for i in range(1, 16):
+                offset = (i - 8) * 5
+                if self.rotation in (90, 270):
+                    direction = 1 if self.rotation == 90 else -1
+                    x_raw = np.clip(cx_raw + offset * direction, 0, tw_raw - 1)
+                    y_raw = cy_raw
+                else:
+                    direction = 1 if self.rotation == 0 else -1
+                    x_raw = cx_raw
+                    y_raw = np.clip(cy_raw + offset * direction, 0, th_raw - 1)
+
+                # Map raw coordinate to rotated display coordinate (cy_disp=Y, cx_disp=X)
+                cy_disp, cx_disp = self._coord_to_image((y_raw, x_raw), thermal, thermal_img)
+
+                # Make center point P8 slightly larger (radius+1) for visual distinction
+                radius = max(3, int(sf) + 1) if i == 8 else max(2, int(sf))
+                cv2.circle(pt_mask, (cx_disp, cy_disp), radius, 255, -1)
+
+            # Invert thermal pixels where mask is active
+            thermal_img[pt_mask > 0] = 255 - thermal_img[pt_mask > 0]
+
 
         if self.hotspot_mode in [HotspotMode.MAX, HotspotMode.MINMAX]:
             cmax_d = self._coord_to_image(divmod(frame_stats["cmax"], thermal.shape[1]), thermal, thermal_img)
@@ -868,7 +1043,6 @@ class P3Viewer:
         canvas = np.zeros((ch, cw, 3), dtype=np.uint8)
         canvas[self.top_bar_h : self.top_bar_h + th, 0:tw] = thermal_img
 
-        # Top Status Text with explicit shortcut keys
         rec_status = " [REC(v)]" if self.recording_video else ""
         log_status = " [LOG(l)]" if self.logging_enabled else ""
         if self.fixed_range_enabled and self.cbar_min is not None and self.cbar_max is not None:
@@ -881,10 +1055,8 @@ class P3Viewer:
             cv2.FONT_HERSHEY_SIMPLEX, 0.38 * sf, COLOR_TEXT, max(1, int(sf)), self.cv_linetype
         )
 
-        # Draw Interactive Top UI Buttons
         self._draw_ui_buttons(canvas)
 
-        # Bottom Bar Status
         cmap_name = ColormapID(self.colormap_idx).name
         gain_name = self.camera.gain_mode.name
         emissivity = self.camera.env_params.emissivity
@@ -902,7 +1074,6 @@ class P3Viewer:
             self._draw_help(canvas)
 
         return canvas
-    
 
     def _draw_ui_buttons(self, canvas: NDArray[np.uint8]) -> None:
         """Draw interactive canvas UI buttons with shortcut keys and mouse hover effects."""
@@ -1015,6 +1186,7 @@ class P3Viewer:
         sf = self.scale_factor
         lines = [
             "q-Quit  h-Help  v-Video Rec",
+            "w-Cycle Warp Modes (0-5)",
             "f-Fixed range  l-Spot Log",
             "space-Shot  D-Dump raw",
             "+/- Zoom  r-Rotate  m-Mirror",
@@ -1038,7 +1210,6 @@ class P3Viewer:
                 (int(10 * sf), self.top_bar_h + int((24 + i * 18) * sf)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35 * sf, COLOR_TEXT, max(1, int(sf)), self.cv_linetype
             )
-            
 
     def _toggle_video_recording(self) -> None:
         """Toggle video recording state."""
@@ -1054,17 +1225,6 @@ class P3Viewer:
                 self._video_dim = None
             print(f"Video recording STOPPED and saved: {self.video_filename}")
 
-    def _toggle_spot_logging(self) -> None:
-        """Toggle spot temperature logging live."""
-        self.logging_enabled = not self.logging_enabled
-        if self.logging_enabled:
-            if not self.logfile:
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                self.logfile = f"p3_spot_log_{ts}.csv"
-            self._init_logfile(self.logfile)
-            print(f"Spot logging: STARTED -> {self.logfile}")
-        else:
-            print("Spot logging: STOPPED")
 
     def _toggle_fixed_lock(self) -> None:
         """Toggle fixed temperature range lock on and off."""
@@ -1091,13 +1251,12 @@ class P3Viewer:
             return True
 
         if key == ord("q"):
+            self.cap_visible.release()            
             return False
-
-        #print("In handle key with key:",key, ord("W"),ord("w"))
 
         if key == ord("v"):
             self._toggle_video_recording()
-        elif key in (ord("l"), ord("L"), ord("o")):  # 'l' or 'L' toggles logging
+        elif key in (ord("l"), ord("L"), ord("o")):
             self._toggle_spot_logging()
         elif key == ord("f"):
             self._toggle_fixed_lock()
@@ -1149,19 +1308,22 @@ class P3Viewer:
         elif key == ord("b"):
             self.hotspot_mode = HotspotMode((self.hotspot_mode + 1) % len(HotspotMode))
             print(f"Hotspot mode: {self.hotspot_mode.name}")
-        elif key == ord("w") :  # Warp
-            self.align_mode = (self.align_mode + 1) % 3
-            if self.align_mode == 1:
+        elif key == ord("w"):  # Cycle alignment warp modes 0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 0
+            self.align_mode = (self.align_mode + 1) % 6
+            if self.align_mode in (2, 4):
                 self.needs_alignment_compute = True
-                print("Alignment Mode 1: WARP VISIBLE (Computing transform...)")
-            elif self.align_mode == 2:
-                print("Alignment Mode 2: WARP VISIBLE + THERMAL OVERLAY")
-            else:
-                print("Alignment Mode 0: OFF")
+
+            mode_names = {
+                0: "OFF",
+                1: "RAW OVERLAY (NO WARP)",
+                2: "ORB+ECC WARP",
+                3: "ORB+ECC OVERLAY",
+                4: "HAND ECC WARP",
+                5: "HAND ECC OVERLAY",
+            }
+            print(f"Alignment Mode {self.align_mode}: {mode_names[self.align_mode]}")
 
         return True
-
-                
 
     def _toggle_enhanced(self) -> None:
         self.enhanced = not self.enhanced
@@ -1215,32 +1377,98 @@ class P3Viewer:
         self,
         visible_img: NDArray[np.uint8],
         thermal_gray: NDArray[np.uint8],
-        min_cc_threshold: float = 0.15,
+        use_hand_roi: bool = False,
+        min_cc_threshold: float = 0.08,
     ) -> NDArray[np.float32] | None:
-        """Compute alignment warp matrix using Multi-Scale Pyramid ECC on clean 1-channel edge maps."""
+        """Compute alignment warp matrix with overall scaling estimation + spatial-restricted ORB & Hand ECC."""
         try:
-            # 1. Force visible frame to single-channel 2D uint8 grayscale
+            # Force 1-channel grayscale inputs
             if visible_img.ndim == 3:
                 vis_gray = cv2.cvtColor(visible_img, cv2.COLOR_BGR2GRAY)
             else:
                 vis_gray = visible_img.copy()
 
-            # 2. Force thermal frame to single-channel 2D uint8 grayscale
             if thermal_gray.ndim == 3:
                 thm_gray = cv2.cvtColor(thermal_gray, cv2.COLOR_BGR2GRAY)
             else:
                 thm_gray = thermal_gray.copy()
 
-            # 3. Match resolution
             th, tw = thm_gray.shape[:2]
             if vis_gray.shape[:2] != (th, tw):
                 vis_gray = cv2.resize(vis_gray, (tw, th), interpolation=cv2.INTER_AREA)
 
-            # 4. Blur to suppress clutter and broaden gradient ramps
-            vis_blurred = cv2.GaussianBlur(vis_gray, (5, 5), 0)
-            thm_blurred = cv2.GaussianBlur(thm_gray, (5, 5), 0)
+            # --- HAND TARGET ROI ISOLATION ---
+            x0, y0, roi_w, roi_h = 0, 0, tw, th
+            if use_hand_roi:
+                # Isolate warm hand target using 80th percentile thresholding
+                hot_threshold = np.percentile(thm_gray, 80)
+                _, binary_hot = cv2.threshold(thm_gray, hot_threshold, 255, cv2.THRESH_BINARY)
+                contours, _ = cv2.findContours(binary_hot, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            # 5. Compute 1-channel Sobel structural gradient magnitude maps
+                if contours:
+                    largest_cnt = max(contours, key=cv2.contourArea)
+                    rx, ry, rw, rh = cv2.boundingRect(largest_cnt)
+                    # Add 30px padding around hand/finger target
+                    pad = 30
+                    x0 = max(0, rx - pad)
+                    y0 = max(0, ry - pad)
+                    x1 = min(tw, rx + rw + pad)
+                    y1 = min(th, ry + rh + pad)
+                    roi_w = x1 - x0
+                    roi_h = y1 - y0
+                    print(f"Hand target ROI detected at [{x0},{y0}, {roi_w}x{roi_h}]")
+
+            thm_crop = thm_gray[y0 : y0 + roi_h, x0 : x0 + roi_w]
+            vis_crop = vis_gray[y0 : y0 + roi_h, x0 : x0 + roi_w]
+
+            # --- STAGE A: Spatial-Restricted ORB Match with Scale Estimation ---
+            initial_warp = np.eye(2, 3, dtype=np.float32)
+            try:
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                vis_enhanced = clahe.apply(vis_crop)
+                thm_enhanced = clahe.apply(thm_crop)
+
+                orb = cv2.ORB_create(nfeatures=1200, scoreType=cv2.ORB_FAST_SCORE)
+                kp_thm, des_thm = orb.detectAndCompute(thm_enhanced, None)
+                kp_vis, des_vis = orb.detectAndCompute(vis_enhanced, None)
+
+                if des_thm is not None and des_vis is not None and len(kp_thm) >= 4 and len(kp_vis) >= 4:
+                    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+                    matches = bf.knnMatch(des_thm, des_vis, k=2)
+
+                    good_matches = []
+                    for m_tuple in matches:
+                        if len(m_tuple) == 2:
+                            m, n = m_tuple
+                            if m.distance < 0.75 * n.distance:
+                                pt_thm = kp_thm[m.queryIdx].pt
+                                pt_vis = kp_vis[m.trainIdx].pt
+                                # Spatial proximity filter: restrict to points within 80px distance
+                                spatial_dist = np.hypot(pt_thm[0] - pt_vis[0], pt_thm[1] - pt_vis[1])
+                                if spatial_dist < 80.0:
+                                    good_matches.append(m)
+
+                    if len(good_matches) >= 4:
+                        pts_thm = np.float32([kp_thm[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                        pts_vis = np.float32([kp_vis[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+                        # estimateAffinePartial2D explicitly solves for scale + rotation + translation
+                        M_est, inliers = cv2.estimateAffinePartial2D(
+                            pts_vis, pts_thm, method=cv2.RANSAC, ransacReprojThreshold=5.0
+                        )
+                        if M_est is not None:
+                            initial_warp = M_est.astype(np.float32)
+                            num_inliers = int(np.sum(inliers)) if inliers is not None else 0
+                            # Extract scale factor from transformation matrix
+                            estimated_scale = np.hypot(M_est[0, 0], M_est[0, 1])
+                            print(f"ORB pre-scaling succeeded (Scale Ratio: {estimated_scale:.3f}, {num_inliers} inliers).")
+            except Exception as fe:
+                print(f"ORB feature alignment skipped: {fe}")
+
+            # --- STAGE B: Pyramid ECC Optimization on Edge Magnitude Maps ---
+            vis_blurred = cv2.GaussianBlur(vis_crop, (5, 5), 0)
+            thm_blurred = cv2.GaussianBlur(thm_crop, (5, 5), 0)
+
             vis_gx = cv2.Sobel(vis_blurred, cv2.CV_32F, 1, 0, ksize=3)
             vis_gy = cv2.Sobel(vis_blurred, cv2.CV_32F, 0, 1, ksize=3)
             vis_edges = cv2.magnitude(vis_gx, vis_gy)
@@ -1249,17 +1477,9 @@ class P3Viewer:
             thm_gy = cv2.Sobel(thm_blurred, cv2.CV_32F, 0, 1, ksize=3)
             thm_edges = cv2.magnitude(thm_gx, thm_gy)
 
-            # Ensure strict 1-channel float32 matrices
-            if vis_edges.ndim > 2:
-                vis_edges = vis_edges[:, :, 0]
-            if thm_edges.ndim > 2:
-                thm_edges = thm_edges[:, :, 0]
-
-            # Normalize gradient maps to [0, 1] range
             vis_edges = cv2.normalize(vis_edges, None, 0.0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
             thm_edges = cv2.normalize(thm_edges, None, 0.0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
 
-            # 6. Build 3-level Gaussian Pyramids for Coarse-to-Fine Optimization
             levels = 3
             vis_pyr = [vis_edges]
             thm_pyr = [thm_edges]
@@ -1268,44 +1488,56 @@ class P3Viewer:
                 vis_pyr.insert(0, cv2.pyrDown(vis_pyr[0]))
                 thm_pyr.insert(0, cv2.pyrDown(thm_pyr[0]))
 
-            # Initialize 2x3 Affine transformation matrix
-            warp_matrix = np.eye(2, 3, dtype=np.float32)
-            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 80, 1e-4)
+            warp_roi = initial_warp.copy()
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-4)
+
+            scale_down = 2.0 ** (levels - 1)
+            warp_roi[0, 2] /= scale_down
+            warp_roi[1, 2] /= scale_down
 
             cc = 0.0
-            # 7. Run ECC iteratively from coarse (small) to fine (full resolution)
             for level in range(levels):
                 v_lvl = vis_pyr[level]
                 t_lvl = thm_pyr[level]
 
-                cc, warp_matrix = cv2.findTransformECC(
-                    t_lvl, v_lvl, warp_matrix, cv2.MOTION_AFFINE, criteria
+                cc, warp_roi = cv2.findTransformECC(
+                    t_lvl, v_lvl, warp_roi, cv2.MOTION_AFFINE, criteria
                 )
 
                 if level < levels - 1:
-                    warp_matrix[0, 2] *= 2.0
-                    warp_matrix[1, 2] *= 2.0
+                    warp_roi[0, 2] *= 2.0
+                    warp_roi[1, 2] *= 2.0
 
-            # 8. Reject low-quality correlation matches (< 0.15)
+            # Map ROI transformation matrix back to full frame
+            M_global = np.copy(warp_roi)
+            if use_hand_roi and (x0 > 0 or y0 > 0):
+                M_global[0, 2] = warp_roi[0, 2] + x0 * (1.0 - warp_roi[0, 0]) - warp_roi[0, 1] * y0
+                M_global[1, 2] = warp_roi[1, 2] + y0 * (1.0 - warp_roi[1, 1]) - warp_roi[1, 0] * x0
+
             if cc < min_cc_threshold:
-                print(f"Alignment REJECTED: Correlation score too low ({cc:.3f} < {min_cc_threshold:.3f})")
+                print(f"ECC refinement rejected score ({cc:.3f} < {min_cc_threshold:.3f}).")
+                if not np.array_equal(initial_warp, np.eye(2, 3, dtype=np.float32)):
+                    print("Falling back to ORB scaled pre-alignment matrix.")
+                    return initial_warp
                 return None
 
-            print(f"ECC Alignment Converged! (Correlation Score: {cc:.3f})")
-            return warp_matrix
+            final_scale = np.hypot(M_global[0, 0], M_global[0, 1])
+            print(f"Hybrid Alignment Converged! (Correlation Score: {cc:.3f}, Final Scale: {final_scale:.3f})")
+            return M_global
 
         except cv2.error as e:
-            print(f"ECC Alignment failed to converge: {e}")
+            print(f"Alignment optimization failed: {e}")
+            if 'initial_warp' in locals() and not np.array_equal(initial_warp, np.eye(2, 3, dtype=np.float32)):
+                return initial_warp
         return None
+
 
 def load_config_file(config_path: str) -> dict[str, Any]:
     """Load settings dictionary from JSON configuration file and normalize keys."""
     alias_map = {
-        # Webcam / Visible Camera Aliases
         "webcam": "visible_cam",
         "visible_cam": "visible_cam",
         "visible-cam": "visible_cam",
-        # Temperature Range Aliases
         "min": "min",
         "cbar_min": "min",
         "cbar-min": "min",
@@ -1316,7 +1548,6 @@ def load_config_file(config_path: str) -> dict[str, Any]:
         "cbar-max": "max",
         "temp_max": "max",
         "temp-max": "max",
-        # System & Serial Port Parameters
         "serial_port": "serial_port",
         "serial-port": "serial_port",
         "baud_rate": "baud_rate",
@@ -1342,8 +1573,7 @@ def load_config_file(config_path: str) -> dict[str, Any]:
                     clean_k = k.lower().strip()
                     target_key = alias_map.get(clean_k, clean_k.replace("-", "_"))
                     normalized[target_key] = v
-                    
-                    print(f"Loaded configuration from: {config_path}")
+                print(f"Loaded configuration from: {config_path}")
                 return normalized
             print(f"Warning: Config file {config_path} is not a valid JSON dictionary.")
     except Exception as e:
@@ -1364,7 +1594,6 @@ def main() -> None:
             return False
         raise argparse.ArgumentTypeError(f"invalid boolean value: {val}")
 
-
     # Pass 1: Parse --config or fall back to default 'config.json' if it exists
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", "---config", "-c", type=str, default=None)
@@ -1377,7 +1606,6 @@ def main() -> None:
     config_defaults = {}
     if config_path:
         config_defaults = load_config_file(config_path)
-
 
     # Pass 2: Main CLI argument parser
     parser = argparse.ArgumentParser(

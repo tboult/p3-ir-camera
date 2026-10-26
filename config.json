@@ -4,6 +4,6 @@
   "min": 65.0,
   "max": 95.0,
     "high_res": true,
-    "webcam":0,
+    "webcam":4,
   "logfile": "spot_temps.csv"
 }
