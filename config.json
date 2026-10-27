@@ -1,0 +1,10 @@
+{
+  "model": "p1",
+  "min": 70.0,
+  "max": 75.0,
+  "iso_step": 2.0,
+  "visible_cam": 4,
+  "logfile": "column_log.csv",
+  "bin_file": "thermal_rec.bin"
+}
+
