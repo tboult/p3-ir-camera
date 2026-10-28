@@ -663,11 +663,13 @@ class P3Viewer:
                cv2.imshow(window_name, final_display)
                self._update_fps()
 
-               # Dynamic CPU sleep to strictly enforce target FPS
-               frame_time = time.time() - loop_start
-               target_time = 1.0 / self.target_fps
-               #if self.fps > self.target_fps and  frame_time < target_time:
-               #                   time.sleep(target_time - frame_time)
+               if False and self.target_fps < 25:
+                   # Dynamic CPU sleep to strictly enforce target FPS
+                   frame_time = time.time() - loop_start
+                   target_time = 1.0 / self.target_fps
+                   #if self.target_fps < 25 and frame_time < target_time:
+                   if frame_time < target_time:                   
+                       time.sleep(target_time - frame_time)
 
                key = cv2.waitKey(1) & 0xFF
                if key == ord("q"):

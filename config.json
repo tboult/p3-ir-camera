@@ -3,7 +3,7 @@
   "min": 60.0,
     "max": 90.0,
   "iso_step": 2.0,
-  "visible_cam": 3,
+  "visible_cam": 2,
   "logfile": "column_log.csv",
   "bin_file": "thermal_rec.bin"
 }
