@@ -51,16 +51,36 @@ from p3_camera import (
 # Suppress verbose OpenCV/libjpeg C-level warnings
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
-
+            
 class ThreadedWebcam:
-    """Non-blocking background frame fetcher with V4L2 buffer overflow protection."""
+    """Non-blocking background frame fetcher with V4L2 raw RGGB debayering, dynamic gain & shadow-lifting Gamma LUT."""
+    BAYER_MODES = [
+        ("GBRG", cv2.COLOR_BayerGB2BGR),
+        ("RGGB", cv2.COLOR_BayerRG2BGR),
+        ("BGGR", cv2.COLOR_BayerBG2BGR),
+        ("GRBG", cv2.COLOR_BayerGR2BGR),
+    ]
 
-    def __init__(self, src: int | str | None, width: int = 1280, height: int = 720):
+    def __init__(
+        self,
+        src: int | str | None,
+        width: int = 320,
+        height: int = 240,
+        target_fps: float = 25.0,
+    ):
         self.cap = None
         self.running = False
         self.ret = False
         self.frame = None
         self.lock = threading.Lock()
+        self.target_fps = target_fps
+
+        # Dynamic Bayer pattern index (0=RGGB, 1=BGGR, 2=GBRG, 3=GRBG)
+        self.bayer_idx = 0
+        
+        # Default gamma setting (gamma < 1.0 lifts dark shadows without blowing highlights)
+        self.gamma = 0.45
+        self.gamma_lut = self._build_gamma_lut(self.gamma)
 
         if src is None:
             return
@@ -74,35 +94,152 @@ class ThreadedWebcam:
         if self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-            # 1. Force MJPEG FOURCC matching your camera's active hardware stream
-            mjpg_fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-            self.cap.set(cv2.CAP_PROP_FOURCC, mjpg_fourcc)
+            # Disable V4L2 RGB auto-conversion to accept raw Bayer RGGB streams
+            self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, 330)            
+            self.cap.set(cv2.CAP_PROP_GAIN, 64)
 
-            # 2. Negotiate 1280x720 @ 30 FPS
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            # Format priority list: Raw Bayer (RGGB/BA81) -> Hardware Compressed -> YUV -> Driver Default
+            formats_to_try = [
+                ("RGGB", cv2.VideoWriter_fourcc(*"RGGB")),
+                ("BA81", cv2.VideoWriter_fourcc(*"BA81")),
+                ("MJPG", cv2.VideoWriter_fourcc(*"MJPG")),
+                ("YUYV", cv2.VideoWriter_fourcc(*"YUYV")),
+                ("DEFAULT", 0),
+            ]
 
-            # 3. Sensor warm-up loop: Flush initial blank/black V4L2 buffer frames
-            for _ in range(5):
-                ret, frame = self.cap.read()
-                if ret and frame is not None and frame.size > 0:
-                    self.ret, self.frame = ret, frame
+            resolutions = [(width, height), (320, 240), (640, 480)]
+
+            negotiated = False
+            for fmt_name, fourcc in formats_to_try:
+                if fourcc != 0:
+                    self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+
+                for w, h in resolutions:
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                    self.cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+
+                    # Flush initial V4L2 buffers & test stream validity
+                    for _ in range(5):
+                        ret, raw = self.cap.read()
+                        if ret and raw is not None and raw.size > 0:
+                            processed = self._ensure_bgr(raw, w, h)
+                            if processed is not None:
+                                self.ret, self.frame = True, processed
+                                negotiated = True
+                                print(
+                                    f"Threaded webcam connected on device {src} "
+                                    f"({processed.shape[1]}x{processed.shape[0]} {fmt_name} @ {self.target_fps} FPS)"
+                                )
+                                break
+                    if negotiated:
+                        break
+                if negotiated:
+                    break
+
+            if not negotiated:
+                # Fallback to direct read if explicit negotiation returned empty frames
+                ret, raw = self.cap.read()
+                if ret and raw is not None:
+                    w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or width
+                    h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or height
+                    self.ret, self.frame = True, self._ensure_bgr(raw, w, h)
 
             self.running = True
             self.thread = threading.Thread(target=self._update, daemon=True)
             self.thread.start()
-            print(f"Threaded webcam initialized on device {src} ({width}x{height} MJPG)")
         else:
             print(f"Warning: ThreadedWebcam could not open camera {src}")
+
+    @staticmethod
+    def _build_gamma_lut(gamma: float) -> np.ndarray:
+        """Create 256-entry LUT for non-linear shadow expansion."""
+        inv_gamma = gamma
+        lut = np.array([((i / 255.0) ** inv_gamma) * 255.0 for i in range(256)]).astype(np.uint8)
+        return lut
+
+    def set_gamma(self, delta: float) -> float:
+        """Adjust software gamma live (lower = brighter shadows)."""
+        self.gamma = max(0.1, min(1.0, self.gamma + delta))
+        with self.lock:
+            self.gamma_lut = self._build_gamma_lut(self.gamma)
+        print(f"Visible Gamma set to: {self.gamma:.2f}")
+        return self.gamma
+
+    def set_gain(self, delta: float) -> float:
+        """Increase or decrease visible camera gain dynamically."""
+        if self.cap and self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            current = self.cap.get(cv2.CAP_PROP_GAIN)
+            new_gain = min(255.0, max(0.0, current + delta))
+            self.cap.set(cv2.CAP_PROP_GAIN, new_gain)
+            actual_gain = self.cap.get(cv2.CAP_PROP_GAIN)
+            print(f"Visible Camera Gain set to: {actual_gain}")
+            return actual_gain
+        return 0.0
+
+    def get_gain(self) -> float:
+        if self.cap and self.cap.isOpened():
+            return self.cap.get(cv2.CAP_PROP_GAIN)
+        return 0.0
+
+    def cycle_bayer_phase(self) -> str:
+        """Cycle through the 4 Bayer phases live to eliminate grid patterns."""
+        self.bayer_idx = (self.bayer_idx + 1) % len(self.BAYER_MODES)
+        phase_name = self.BAYER_MODES[self.bayer_idx][0]
+        print(f"Bayer Phase switched to: {phase_name}")
+        return phase_name
+
+    def _ensure_bgr(self, frame: np.ndarray, width: int = 320, height: int = 480) -> np.ndarray | None:
+        """Reshape raw 1D/2D V4L2 buffers, decode MJPEG streams, or debayer with active Bayer phase."""
+        if frame is None or frame.size == 0:
+            return None
+
+        # Determine active OpenCV conversion flag (Edge-Aware)
+        _, cv_code = self.BAYER_MODES[self.bayer_idx]
+
+        # 1. Already a standard 3-channel BGR frame
+        if frame.ndim == 3 and frame.shape[2] == 3:
+            bgr = frame
+        else:
+            flat = frame.squeeze()
+
+            # 2. Match raw Bayer pixel dimensions and debayer
+            if flat.size == width * height:
+                raw_2d = flat.reshape((height, width))
+                bgr = cv2.cvtColor(raw_2d, cv_code)
+            elif flat.size == 320 * 240:
+                raw_2d = flat.reshape((240, 320))
+                bgr = cv2.cvtColor(raw_2d, cv_code)
+            elif flat.size == 640 * 480:
+                raw_2d = flat.reshape((480, 640))
+                bgr = cv2.cvtColor(raw_2d, cv_code)
+            else:
+                decoded = cv2.imdecode(flat, cv2.IMREAD_COLOR)
+                if decoded is not None:
+                    bgr = decoded
+                else:
+                    return None
+
+        # 3. Apply non-linear Gamma tone-mapping
+        with self.lock:
+            gamma_lut = self.gamma_lut
+        return cv2.LUT(bgr, gamma_lut)    
+
 
     def _update(self) -> None:
         while self.running:
             if self.cap and self.cap.isOpened():
                 ret, frame = self.cap.read()
                 if ret and frame is not None and frame.size > 0:
-                    with self.lock:
-                        self.ret, self.frame = ret, frame
+                    w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+                    h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+                    bgr_frame = self._ensure_bgr(frame, w, h)
+                    if bgr_frame is not None:
+                        with self.lock:
+                            self.ret, self.frame = ret, bgr_frame
 
     def read(self) -> tuple[bool, np.ndarray | None]:
         with self.lock:
@@ -196,7 +333,14 @@ def get_colormap(cmap_id: ColormapID | int) -> NDArray[np.uint8]:
 
 
 def apply_colormap(img_u8: NDArray[np.uint8], cmap_id: ColormapID | int) -> NDArray[np.uint8]:
-    lut = get_colormap(cmap_id)
+    lut = get_colormap(cmap_id).copy()
+
+    # 2. Bake isotherm colors directly into indices 0, 1, 254, 255 (O(1) execution time)
+    lut[0] = [255, 0, 0]     # Blue (Cold Band 1)
+    lut[1] = [255, 255, 255] # White (Cold Band 2)
+    lut[254] = [0, 0, 255]   # Red (Hot Band 1)
+    lut[255] = [0, 0, 0] # black (Hot Band 2)
+    
     return lut[img_u8]
 
 
@@ -290,6 +434,7 @@ class P3Viewer:
         high_res: bool = False,
         logfile: str | None = None,
         bin_file: str | None = None,
+        target_fps: float = 25.0,
     ) -> None:
         config = get_model_config(model)
         self.camera = P3Camera(config=config)
@@ -356,7 +501,9 @@ class P3Viewer:
 
         # Align mode: 0 = OFF, 1 = RAW OVERLAY
         self.align_mode: int = 0
-        self.cap_visible = ThreadedWebcam(self.visible_cam_id)
+        self.target_fps = target_fps
+        self.cap_visible = ThreadedWebcam(self.visible_cam_id, width=self.target_w, height=self.target_h, target_fps=target_fps)
+
 
     def _generate_timestamped_filename(self, filename: str | None = None, default_ext: str = ".csv") -> str:
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -478,6 +625,7 @@ class P3Viewer:
                 self._video_dim = None
             print(f"Composite Video Recording: STOPPED -> {self.video_filename}")
 
+
     def run(self) -> None:
         model_name = self.model.value.upper()
         window_name = f"{model_name} Thermal Inspector"
@@ -492,39 +640,67 @@ class P3Viewer:
         self.camera.init()
         self.camera.start_streaming()
 
+
+	# In P3Viewer.run() main loop:
         try:
             while True:
-                _, thermal = self.camera.read_frame_both()
-                if thermal is None:
-                    continue
+               loop_start = time.time()
 
-                thermal = tnr(thermal, self._prev_frame, alpha=self.tnr_alpha)
-                self._prev_frame = thermal.copy()
+               _, thermal = self.camera.read_frame_both()
+               if thermal is None:
+                   continue
 
-                rendered_thermal = self._render(thermal)
-                final_display, record_frame = self._process_dual_camera(rendered_thermal)
-                self._last_display = final_display
+               thermal = tnr(thermal, self._prev_frame, alpha=self.tnr_alpha)
+               self._prev_frame = thermal.copy()
 
-                if self.recording_video:
-                    self._record_frame_to_video(record_frame)
+               rendered_thermal = self._render(thermal)
+               final_display, record_frame = self._process_dual_camera(rendered_thermal)
+               self._last_display = final_display
 
-                cv2.imshow(window_name, final_display)
-                self._update_fps()
+               if self.recording_video:
+                   self._record_frame_to_video(record_frame)
 
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q") or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                    break
-                elif key == ord("v"):
+               cv2.imshow(window_name, final_display)
+               self._update_fps()
+
+               # Dynamic CPU sleep to strictly enforce target FPS
+               frame_time = time.time() - loop_start
+               target_time = 1.0 / self.target_fps
+               #if self.fps > self.target_fps and  frame_time < target_time:
+               #                   time.sleep(target_time - frame_time)
+
+               key = cv2.waitKey(1) & 0xFF
+               if key == ord("q"):
+                   break
+               elif key == ord("v"):
                     self._toggle_video_recording()
-                elif key == ord("b"):
+               elif key == ord("b"):
                     self._toggle_binary_recording()
-                elif key in (ord("l"), ord("L"), ord("o")):
+               elif key in (ord("l"), ord("L"), ord("o")):
                     self._toggle_spot_logging()
-                elif key == ord("w"):
+               elif key == ord("w"):
                     self.align_mode = (self.align_mode + 1) % 2
-                elif key == ord("c"):
+               elif key == ord("c"):
                     self.colormap_idx = (self.colormap_idx + 1) % len(ColormapID)
-                elif key == ord("r"):
+                    # Cycle through Bayer phases (RGGB -> BGGR -> GBRG -> GRBG)
+               elif key == ord("k"):
+                   if self.cap_visible:
+                       self.cap_visible.cycle_bayer_phase()
+               elif key == ord("="):
+                    self.cap_visible.set_gain(1.0)  # Increase gain
+               elif key == ord("-"):
+                    self.cap_visible.set_gain(-1.0) # Decrease gain
+               elif key == ord("0"):
+                    self.cap_visible.set_gain(5.0)  # Increase gain a lot
+               elif key == ord("9"):
+                    self.cap_visible.set_gain(-5.0) # Decrease gain a lot
+                    # Hotkeys to boost dark shadow details without highlight bloomin
+               elif key == ord("]"):
+                    self.cap_visible.set_gamma(-0.05)  # Brighten shadows (lower gamma value)
+               elif key == ord("["):
+                    self.cap_visible.set_gamma(0.05)   # Flatten image (higher gamma value)
+    
+               elif key == ord("r"):
                     self.rotation = (self.rotation + 90) % 360
         finally:
             if self.bin_handle:
@@ -617,14 +793,6 @@ class P3Viewer:
 
         # Apply standard colormap to in-range temperatures (indices 2..253)
         img = apply_colormap(u8_iso, self.colormap_idx)
-
-        # Cold Isotherm: Alternating Blue and White
-        img[u8_iso == 0] = (255, 0, 0)     # Blue
-        img[u8_iso == 1] = (255, 255, 255) # White
-
-        # Hot Isotherm: Alternating Red and White
-        img[u8_iso == 254] = (0, 0, 255)   # Red
-        img[u8_iso == 255] = (0, 0, 0) # black
 
         if self.show_reticule:
             img = draw_reticule_and_points(img, scale_factor=self.scale_factor)
@@ -794,11 +962,7 @@ def run_playback(
                 p8_str = f"P8: >{cbar_max:.0f}{unit_str}"
 
             color_th = apply_colormap(u8_frame, cmap_idx)
-            color_th[u8_frame == 0] = (255, 0, 0)     # Blue
-            color_th[u8_frame == 1] = (255, 255, 255) # White
-            color_th[u8_frame == 254] = (0, 0, 255)   # Red
-            color_th[u8_frame == 255] = (0, 0, 0) # black
-            
+
             color_th = cv2.resize(color_th, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
             color_th = draw_reticule_and_points(color_th, scale_factor=sf)
 
@@ -874,10 +1038,14 @@ def run_playback(
 
 def load_config_file(config_path: str) -> dict[str, Any]:
     """Load settings dictionary from JSON configuration file and normalize keys."""
+
     alias_map = {
         "webcam": "visible_cam",
         "visible_cam": "visible_cam",
         "visible-cam": "visible_cam",
+        "fps": "fps",
+        "target_fps": "fps",
+        "frame_rate": "fps",
         "min": "cbar_min",
         "cbar_min": "cbar_min",
         "cbar-min": "cbar_min",
@@ -897,7 +1065,7 @@ def load_config_file(config_path: str) -> dict[str, Any]:
         "logfile": "logfile",
         "bin_file": "bin_file",
         "bin-file": "bin_file",
-    }
+    }    
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -946,6 +1114,11 @@ def main() -> None:
     parser.add_argument("--play", type=str, default=None, help="Path to .bin thermal recording to replay")
     parser.add_argument("--play-vis", type=str, default=None, help="Path to visible .mp4 video to sync with thermal playback")
     parser.add_argument("--export-mp4", type=str, default=None, help="Path to save playback composition as MP4 video")
+
+    parser.add_argument("--fps", type=float, default=25.0, help="Target frame rate limit (e.g. 15, 20, 25, 30)")
+    parser.add_argument("--cam-w", type=int, default=320, help="Webcam capture width (default: 320)")
+    parser.add_argument("--cam-h", type=int, default=240, help="Webcam capture height (default: 240)")
+    
 
     if config_defaults:
         parser.set_defaults(**config_defaults)
